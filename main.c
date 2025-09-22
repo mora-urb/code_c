@@ -12,6 +12,46 @@
 #define N_CHILDREN 61
 #define BUF_SIZE   8192
 #define FILE_NAME  "text_to_read.txt"
+#define PATRON "existe"
+
+static size_t cstrlen(const char *s) {
+    size_t n = 0;
+    while (s[n] != '\0') n++;
+    return n;
+}
+
+static int match_at(const char *buf, size_t len, size_t pos, const char *word, size_t wlen) {
+    if (pos + wlen > len) return 0;
+    for (size_t k = 0; k < wlen; k++) {
+        if (buf[pos + k] != word[k]) return 0;
+    }
+    return 1;
+}
+
+int print_word_context_100(const char *buf, size_t len, const char *word) {
+    const size_t CTX = 100;
+    size_t wlen = cstrlen(word);
+    int matches = 0;
+
+    if (wlen == 0) return 0;
+    if (len == 0) return 0;
+
+    for (size_t i = 0; i + wlen <= len; i++) {
+        if (!match_at(buf, len, i, word, wlen)) continue;
+
+        size_t start = (i > CTX) ? (i - CTX) : 0;
+        size_t end   = i + wlen + CTX;
+        if (end > len) end = len;
+
+        fwrite(buf + start, 1, end - start, stdout);
+        fputc('\n', stdout);
+
+        matches++;
+    }
+
+    return matches;
+}
+
 
 static int trabajo_hijos_buffer(const char *buf, size_t len) {
     regex_t regex;
@@ -24,7 +64,7 @@ static int trabajo_hijos_buffer(const char *buf, size_t len) {
     for (size_t i = 0; i < copy; i++) local[i] = buf[i];
     local[copy] = '\0';
 
-    reti = regcomp(&regex, "existe", REG_EXTENDED | REG_NOSUB);
+    reti = regcomp(&regex, PATRON, REG_EXTENDED | REG_NOSUB);
     if (reti != 0) {
         fprintf(stderr, "El patrón no se pudo compilar\n");
         return 2;
@@ -32,7 +72,12 @@ static int trabajo_hijos_buffer(const char *buf, size_t len) {
 
     reti = regexec(&regex, local, 0, NULL, 0);
     if (reti == 0) {
-        puts("Match");
+        puts("Match - start");
+
+        print_word_context_100(local, copy, PATRON);
+
+        puts("Match - end");
+        
         rc = 0;
     } else if (reti == REG_NOMATCH) {
         puts("No match");
