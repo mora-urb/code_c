@@ -29,6 +29,7 @@
         "*.prefab": "yaml",
         "*.unity": "yaml",
         "stdio.h": "c",
-        "types.h": "c"
+        "types.h": "c",
+        "regex.h": "c"
     }
 }
