@@ -7,18 +7,17 @@
 #include <string.h>
 #include <errno.h>
 
-
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
+#include <time.h>
 
-#define N_CHILDREN 5
+#define N_CHILDREN 10
 #define BUF_SIZE   8192
 #define FILE_NAME  "text_to_read.txt"
 #define PATRON     "existe"
-
 
 #define MSGSZ 128
 struct message {
@@ -155,7 +154,7 @@ static size_t leer_parrafos_hasta_llenar(int data_fd, off_t start_off, char *dst
     return used;
 }
 
-
+/* ---------- Cambio: hijo mide duración y la devuelve en el mensaje ---------- */
 static void loop_hijo(int idx_hijo, int data_fd, int q_p2c, int q_c2p) {
     char local[BUF_SIZE];
     size_t used = 0;
@@ -178,27 +177,35 @@ static void loop_hijo(int idx_hijo, int data_fd, int q_p2c, int q_c2p) {
                 off_t start = (off_t)off_ll;
                 off_t next;
 
+                /* medir tiempo antes de leer+procesar */
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+
                 used = leer_parrafos_hasta_llenar(data_fd, start, local, BUF_SIZE, &next);
 
                 (void)trabajo_hijos_buffer(local, used);
 
-                struct message resp;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                double duration_s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
+                struct message resp;
                 resp.type = mytype;
 
-                snprintf(resp.text, MSGSZ, "NEXT %lld", (long long)next);
+                /* Enviamos NEXT <next_off> DUR <duration_s> */
+                snprintf(resp.text, MSGSZ, "NEXT %lld DUR %.6f", (long long)next, duration_s);
 
                 if (msgsnd(q_c2p, &resp, MSGSZ, 0) < 0) {
                     perror("msgsnd hijo->padre");
                     _exit(3);
                 }
-                
 
                 used = 0;
             }
         }
     }
 }
+
+/* -------------------------------------------------------------------------- */
 
 int main() {
     double time_spent;
@@ -217,11 +224,27 @@ int main() {
     int q_c2p = msgget(IPC_PRIVATE, IPC_CREAT | S_IRUSR | S_IWUSR);
     if (q_c2p < 0) { perror("msgget q_c2p"); msgctl(q_p2c, IPC_RMID, NULL); return 1; }
 
+    /* ---------- Cambio: abrir CSV para registro en el proceso padre ---------- */
+    char logfile_name[128];
+    snprintf(logfile_name, sizeof(logfile_name), "log_%d.csv", N_CHILDREN);
+    FILE *logf = fopen(logfile_name, "w");
+    if (!logf) {
+        perror("fopen logfile");
+        /* seguimos pero sin logfile */
+    } else {
+        /* cabecera CSV */
+        fprintf(logf, "start_off,next_off,child_idx,child_pid,duration_s,timestamp\n");
+        fflush(logf);
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     pid_t pid = -1;
     int soy_hijo = 0;
     int mi_idx = -1;
+
+    pid_t child_pids[N_CHILDREN];
+    for (int i = 0; i < N_CHILDREN; i++) child_pids[i] = -1;
 
     for (int i = 0; i < N_CHILDREN; i++) {
         pid = fork();
@@ -230,6 +253,9 @@ int main() {
             soy_hijo = 1;
             mi_idx = i;
             break;
+        } else {
+            /* padre guarda pid del hijo en el índice i */
+            child_pids[i] = pid;
         }
     }
 
@@ -242,7 +268,9 @@ int main() {
 
             struct message cmd;
             cmd.type = (long)(i + 1);
-            snprintf(cmd.text, MSGSZ, "A %lld", (long long)next_off);
+            /* Guardamos el offset que enviamos para luego registrar start_off */
+            off_t sent_off = next_off;
+            snprintf(cmd.text, MSGSZ, "A %lld", (long long)sent_off);
             if (msgsnd(q_p2c, &cmd, MSGSZ, 0) < 0) {
                 perror("msgsnd padre->hijo");
                 break;
@@ -257,11 +285,32 @@ int main() {
             resp.text[MSGSZ - 1] = '\0';
 
             long long nx = (long long)next_off;
-
-            if (sscanf(resp.text, "NEXT %lld", &nx) == 1) {
+            double dur = 0.0;
+            if (sscanf(resp.text, "NEXT %lld DUR %lf", &nx, &dur) == 2) {
                 if ((off_t)nx > next_off) {
                     next_off = (off_t)nx;
                 }
+            } else if (sscanf(resp.text, "NEXT %lld", &nx) == 1) {
+                if ((off_t)nx > next_off) {
+                    next_off = (off_t)nx;
+                }
+            }
+
+            /* Escribir en CSV: start_off,next_off,child_idx,child_pid,duration_s,timestamp */
+            if (logf) {
+                time_t now = time(NULL);
+                char timestr[64];
+                struct tm tm_now;
+                localtime_r(&now, &tm_now);
+                strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm_now);
+
+                int child_idx = (int)(resp.type - 1);
+                pid_t child_pid = -1;
+                if (child_idx >= 0 && child_idx < N_CHILDREN) child_pid = child_pids[child_idx];
+
+                fprintf(logf, "%lld,%lld,%d,%ld,%.6f,%s\n",
+                        (long long)sent_off, nx, child_idx, (long)child_pid, dur, timestr);
+                fflush(logf);
             }
 
             turno++;
@@ -288,6 +337,7 @@ int main() {
         if (msgctl(q_p2c, IPC_RMID, NULL) < 0) perror("msgctl IPC_RMID q_p2c");
         if (msgctl(q_c2p, IPC_RMID, NULL) < 0) perror("msgctl IPC_RMID q_c2p");
 
+        if (logf) fclose(logf);
         close(data_fd);
         return 0;
 
